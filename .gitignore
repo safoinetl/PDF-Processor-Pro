@@ -1,0 +1,17 @@
+# Python-related
+*.pyc
+*.pyo
+__pycache__/
+
+# Virtual Environment
+venv/
+.env/
+# Logs
+*.log
+
+# IDE specific
+.idea/
+.vscode/
+
+# Pytest cache
+.cache/
