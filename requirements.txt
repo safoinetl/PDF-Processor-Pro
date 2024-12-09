@@ -1,8 +1,18 @@
-langchain
-langchain-community
-fpdf2
+# langchain
+# langchain-community
+# fpdf2
+# streamlit
+# transformers
+# pdfplumber
+# faiss-cpu
+# python-dotenv
 streamlit
-transformers
 pdfplumber
+PyPDF2
+fpdf
+langchain
+transformers
+huggingface-hub
 faiss-cpu
-python-dotenv
+unicodedata2
+concurrent-log-handler

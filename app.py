@@ -2,27 +2,27 @@ import streamlit as st
 from PyPDF2 import PdfReader
 from fpdf import FPDF
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain_community.llms import HuggingFaceHub
 import pdfplumber
 import os
 import concurrent.futures
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import unicodedata
 import logging
 from typing import List, Callable, Dict, Any
 import tempfile
 import time
 from datetime import datetime
+import requests
+import json
+from functools import lru_cache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# Add caching for better performance
+@lru_cache(maxsize=1000)
+def cache_chunk_summary(chunk: str) -> str:
+    return chunk
 
 class CustomPDF(FPDF):
     def __init__(self):
@@ -31,131 +31,125 @@ class CustomPDF(FPDF):
         self.set_font("Arial", size=12)
         
     def header(self):
-        """Add custom header to each page"""
         self.set_font('Arial', 'B', 12)
         self.cell(0, 10, 'Document Summary', 0, 1, 'C')
         self.ln(5)
         
     def footer(self):
-        """Add custom footer to each page"""
         self.set_y(-15)
         self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
 
-    def sanitize_text(self, text: str) -> str:
-        """Sanitize text for PDF output"""
-        text = unicodedata.normalize('NFKD', text)
-        return ''.join(c for c in text if ord(c) < 128)
-
     def chapter_title(self, title):
-        """Add a chapter title with consistent formatting"""
         self.set_font("Arial", "B", 16)
         self.cell(0, 10, title, ln=True, align='L')
         self.ln(5)
         self.set_font("Arial", size=12)
 
     def chapter_body(self, text):
-        """Add chapter body text with proper formatting"""
         self.set_font("Arial", size=12)
+        text = self.sanitize_text(text)
         self.multi_cell(0, 10, text)
         self.ln()
 
+    def sanitize_text(self, text: str) -> str:
+        text = unicodedata.normalize('NFKD', str(text))
+        return ''.join(c for c in text if ord(c) < 128)
+
+class MistralClient:
+    def __init__(self, base_url="http://"):
+        self.base_url = base_url
+        self.chat_endpoint = f"{base_url}/api/chat"
+        self._session = requests.Session()
+
+    def check_connection(self) -> bool:
+        try:
+            response = self._session.get(f"{self.base_url}/api/tags")
+            return response.status_code == 200
+        except:
+            return False
+
+    def generate_response(self, system_prompt: str, user_content: str, stream: bool = True) -> str:
+        try:
+            payload = {
+                "model": "mistral",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                "stream": stream
+            }
+            
+            if stream:
+                return self._stream_response(payload)
+            else:
+                response = self._session.post(self.chat_endpoint, json=payload)
+                response.raise_for_status()
+                return response.json()["message"]["content"]
+        except Exception as e:
+            logger.error(f"Error calling model API: {str(e)}")
+            raise
+
+    def _stream_response(self, payload: dict) -> str:
+        response = self._session.post(self.chat_endpoint, json=payload, stream=True)
+        response.raise_for_status()
+        
+        full_response = ""
+        response_container = st.empty()
+        
+        for line in response.iter_lines():
+            if line:
+                chunk = json.loads(line)
+                if "message" in chunk:
+                    content = chunk["message"].get("content", "")
+                    full_response += content
+                    response_container.markdown(full_response)
+        
+        return full_response
+
 class PDFProcessor:
     def __init__(self):
-        """Initialize the PDF processor with required models and configurations"""
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
-            self.model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large-cnn")
-            self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1500,
-                chunk_overlap=300,
-                length_function=len
-            )
-            self.embeddings = HuggingFaceEmbeddings()
-        except Exception as e:
-            logger.error(f"Error initializing models: {str(e)}")
-            raise
+        self.mistral_client = MistralClient()
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=3000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     @staticmethod
     def extract_text(pdf_file) -> str:
-        """Extract text from PDF file with improved error handling"""
         try:
-            text = ""
             with pdfplumber.open(pdf_file) as pdf:
-                for page in pdf.pages:
-                    extracted = page.extract_text()
-                    if extracted:
-                        text += extracted + "\n"
-            return text
+                return "\n".join(page.extract_text() or "" for page in pdf.pages)
         except Exception as e:
             logger.error(f"Error extracting text from PDF: {str(e)}")
             raise
 
-    def create_chunks(self, text: str) -> List[str]:
-        """Split text into manageable chunks with error handling"""
-        try:
-            return self.text_splitter.split_text(text)
-        except Exception as e:
-            logger.error(f"Error creating chunks: {str(e)}")
-            raise
+    def process_chunks_parallel(self, chunks: List[str]) -> List[str]:
+        futures = []
+        for chunk in chunks:
+            if len(chunk) < 500:
+                futures.append(self.executor.submit(lambda x: x, chunk))
+            else:
+                futures.append(self.executor.submit(self.summarize_chunk, chunk))
+        
+        return [future.result() for future in concurrent.futures.as_completed(futures)]
 
     def summarize_chunk(self, chunk: str) -> str:
-        """Summarize a single chunk of text with improved handling and longer outputs"""
+        cached_summary = cache_chunk_summary(chunk)
+        if cached_summary != chunk:
+            return cached_summary
+            
         try:
-            if len(chunk) < 500:
-                return chunk
-            
-            inputs = self.tokenizer.encode(
-                "summarize: " + chunk,
-                return_tensors="pt",
-                truncation=True,
-                max_length=1024
-            )
-            
-            outputs = self.model.generate(
-                inputs,
-                max_length=300,  # Increased for longer summaries
-                min_length=100,  # Increased minimum length
-                length_penalty=2.0,
-                num_beams=4,
-                early_stopping=True,
-                temperature=0.7,  # Added temperature for more natural text
-                no_repeat_ngram_size=3  # Prevent repetition
-            )
-            
-            summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return summary.strip()
+            system_prompt = """Create a concise, focused summary capturing only essential information."""
+            summary = self.mistral_client.generate_response(system_prompt, chunk, stream=False)
+            return cache_chunk_summary(summary.strip())
         except Exception as e:
             logger.error(f"Error summarizing chunk: {str(e)}")
             return chunk
 
-    def summarize_chunks(self, chunks: List[str], progress_callback: Callable = None) -> List[str]:
-        """Summarize chunks in parallel with progress tracking"""
-        try:
-            summaries = []
-            total_chunks = len(chunks)
-            
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future_to_chunk = {executor.submit(self.summarize_chunk, chunk): i 
-                                 for i, chunk in enumerate(chunks)}
-                
-                for future in concurrent.futures.as_completed(future_to_chunk):
-                    chunk_index = future_to_chunk[future]
-                    try:
-                        summary = future.result()
-                        summaries.append(summary)
-                        if progress_callback:
-                            progress_callback((chunk_index + 1) / total_chunks)
-                    except Exception as e:
-                        logger.error(f"Error processing chunk {chunk_index}: {str(e)}")
-            
-            return [s for s in summaries if s.strip()]
-        except Exception as e:
-            logger.error(f"Error in parallel summarization: {str(e)}")
-            raise
-
     def create_summary_pdf(self, summaries: List[str], metadata: Dict[str, Any] = None) -> str:
-        """Create PDF with summaries using built-in fonts and return the filename"""
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = f"summary_{timestamp}.pdf"
@@ -163,7 +157,6 @@ class PDFProcessor:
             pdf = CustomPDF()
             pdf.add_page()
             
-            # Add metadata if provided
             if metadata:
                 pdf.set_font("Arial", "B", 14)
                 pdf.cell(0, 10, "Document Information", ln=True)
@@ -173,16 +166,11 @@ class PDFProcessor:
                 pdf.ln(10)
             
             pdf.chapter_title("Executive Summary")
-            pdf.set_font("Arial", "I", 12)
-            pdf.cell(0, 10, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
-            pdf.ln(10)
-            
             for i, summary in enumerate(summaries, 1):
                 pdf.set_font("Arial", "B", 12)
                 pdf.cell(0, 10, f"Section {i}", ln=True)
                 pdf.set_font("Arial", size=12)
-                sanitized_summary = pdf.sanitize_text(summary)
-                pdf.chapter_body(sanitized_summary)
+                pdf.chapter_body(summary)
                 pdf.ln(5)
             
             pdf.output(output_filename)
@@ -192,289 +180,209 @@ class PDFProcessor:
             logger.error(f"Error creating PDF: {str(e)}")
             raise
 
-    def create_qa_system(self, text: str) -> Callable:
-        """Create question-answering system with improved response quality"""
-        try:
-            chunks = self.create_chunks(text)
-            vectorstore = FAISS.from_texts(chunks, self.embeddings)
-            qa_chain = load_qa_chain(
-                HuggingFaceHub(
-                    repo_id="google/flan-t5-large",
-                    huggingfacehub_api_token="azerazeazer_api_token",
-                    model_kwargs={
-                        "temperature": 0.7,
-                        "max_length": 1024,  # Increased for longer responses
-                        "min_length": 100,  # Set minimum length
-                        "num_beams": 4,
-                        "no_repeat_ngram_size": 3
-                    }
-                ),
-                chain_type="map_reduce",  # Changed to map_reduce for better handling of long contexts
-                verbose=True
-            )
-            
-            def qa_function(question: str) -> str:
-                try:
-                    # Get relevant documents with increased context
-                    docs = vectorstore.similarity_search(question, k=5)  # Increased k for more context
-                    
-                    # Prepare context from documents
-                    context = "\n".join([doc.page_content for doc in docs])
-                    
-                    # Generate response
-                    response = qa_chain.run(
-                        input_documents=docs,
-                        question=question
-                    )
-                    
-                    # Post-process and validate response
-                    if len(response.strip()) < 50:  # Increased minimum response length
-                        return ("I apologize, but I need more context to provide a detailed answer. "
-                               "Could you please rephrase your question or provide more specifics?")
-                    
-                    # Add confidence statement if response seems uncertain
-                    if any(word in response.lower() for word in ['maybe', 'might', 'possibly']):
-                        response += ("\n\nNote: This response is based on my current understanding of the document. "
-                                   "Please verify critical information in the original text.")
-                    
-                    return response.strip()
-                    
-                except Exception as e:
-                    logger.error(f"Error in QA system: {str(e)}")
-                    return ("I apologize, but I encountered an error processing your question. "
-                           "Please try rephrasing it or ask another question.")
-            
-            return qa_function
-        except Exception as e:
-            logger.error(f"Error creating QA system: {str(e)}")
-            raise
-
-def initialize_chat_history():
-    """Initialize session state variables for chat functionality"""
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "qa_system" not in st.session_state:
-        st.session_state.qa_system = None
-    if "processed_text" not in st.session_state:
-        st.session_state.processed_text = False
-    if "summaries" not in st.session_state:
-        st.session_state.summaries = []
-    if "summary_pdf_path" not in st.session_state:
-        st.session_state.summary_pdf_path = None
-
-def add_message(role: str, content: str):
-    """Add a message to the chat history with improved formatting"""
-    content = content.strip()
-    if not content:
-        return
-        
-    st.session_state.chat_history.append({
-        "role": role,
-        "content": content,
-        "timestamp": datetime.now().strftime("%H:%M:%S")
-    })
-
-def display_chat():
-    """Display the chat history with improved formatting and styling"""
-    for message in st.session_state.chat_history:
-        if message["role"] == "user":
-            st.markdown(f"""
-                <div style='background-color: #f0f2f6; padding: 10px; border-radius: 10px; margin: 5px 0;'>
-                    <div style='color: #666666; font-size: 0.8em; margin-bottom: 5px;'>
-                        {message["timestamp"]}
-                    </div>
-                    <div>
-                        <strong>You:</strong> {message["content"]}
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-                <div style='background-color: #e8f4ea; padding: 10px; border-radius: 10px; margin: 5px 0;'>
-                    <div style='color: #666666; font-size: 0.8em; margin-bottom: 5px;'>
-                        {message["timestamp"]}
-                    </div>
-                    <div>
-                        <strong>Assistant:</strong> {message["content"]}
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
-
-def main():
-    st.set_page_config(page_title="PDF Processor Pro", layout="wide")
+def initialize_streamlit():
+    st.set_page_config(
+        page_title="PDF Processor Pro",
+        layout="wide",
+        initial_sidebar_state="collapsed"
+    )
     
-    initialize_chat_history()
-    
-    st.title("📚 PDF Processor Pro")
-    st.write("Upload your PDF for summarization and interactive Q&A")
-    
-    # Add CSS for better styling
     st.markdown("""
         <style>
+            .main {
+                padding: 2rem;
+            }
             .stTextInput > div > div > input {
                 padding: 15px;
                 border-radius: 10px;
+                background-color: #f8f9fa;
             }
             .stButton > button {
-                padding: 10px 25px;
+                padding: 12px 30px;
                 border-radius: 10px;
+                background-color: #007bff;
+                color: white;
+                font-weight: 500;
             }
-            div[data-testid="stMarkdownContainer"] > div {
+            .stButton > button:hover {
+                background-color: #0056b3;
+            }
+            .chat-message {
+                padding: 1.5rem;
+                border-radius: 10px;
+                margin: 1rem 0;
+                animation: fadeIn 0.5s;
+            }
+            .user-message {
+                background-color: #f0f2f6;
+            }
+            .assistant-message {
+                background-color: #e8f4ea;
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .stExpander {
+                background-color: #ffffff;
+                border-radius: 10px;
+                border: 1px solid #e0e0e0;
                 margin: 10px 0;
             }
-            .upload-section {
-                padding: 20px;
-                border-radius: 10px;
-                border: 2px dashed #cccccc;
-                text-align: center;
+            /* Hide the default submit button */
+            .stButton {
+                display: none;
             }
         </style>
     """, unsafe_allow_html=True)
+
+def display_chat():
+    chat_container = st.container()
+    with chat_container:
+        for message in st.session_state.get('chat_history', []):
+            message_class = "user-message" if message["role"] == "user" else "assistant-message"
+            st.markdown(f"""
+                <div class="chat-message {message_class}">
+                    <div style="color: #666666; font-size: 0.8em; margin-bottom: 5px;">
+                        {message["timestamp"]}
+                    </div>
+                    <div>
+                        <strong>{'You' if message["role"] == "user" else 'Assistant'}:</strong> {message["content"]}
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+def create_qa_system(text: str) -> Callable:
+    processor = st.session_state.processor
+    chunks = processor.text_splitter.split_text(text)
     
-    # File upload section
-    with st.container():
-        uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    def qa_function(question: str) -> str:
+        context = "\n".join(chunks[:3])
+        system_prompt = """Answer questions based on the provided context. Be concise and accurate."""
+        user_content = f"Context: {context}\n\nQuestion: {question}"
+        return processor.mistral_client.generate_response(system_prompt, user_content)
     
-    if uploaded_file is not None:
-        try:
-            # Only process the document if it hasn't been processed yet
-            if not st.session_state.processed_text:
-                processor = PDFProcessor()
-                
-                with st.spinner("📄 Extracting text from PDF..."):
-                    text = processor.extract_text(uploaded_file)
-                    if not text.strip():
-                        st.error("❌ No text could be extracted from the PDF. Please ensure it's not a scanned document.")
-                        return
+    return qa_function
 
-                st.success(f"✅ Successfully extracted {len(text):,} characters.")
-                
-                with st.spinner("🔄 Processing document..."):
-                    chunks = processor.create_chunks(text)
-                    st.info(f"📊 Created {len(chunks)} text chunks for processing.")
-                    
-                    progress_bar = st.progress(0)
-                    
-                    def update_progress(progress):
-                        progress_bar.progress(progress)
-                    
-                    summaries = processor.summarize_chunks(chunks, update_progress)
-                    st.session_state.summaries = summaries
-                    
-                    st.success(f"✅ Successfully summarized {len(summaries)} sections.")
-                    
-                    # Create and save summary PDF with metadata
-                    metadata = {
-                        "Original File": uploaded_file.name,
-                        "Processed Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "Number of Sections": len(summaries)
-                    }
-                    
-                   # Continuing from the previous code...
-                    
-                    summary_pdf_path = processor.create_summary_pdf(summaries, metadata)
-                    st.session_state.summary_pdf_path = summary_pdf_path
-                    
-                    # Create Q&A system and store in session state
-                    st.session_state.qa_system = processor.create_qa_system(text)
-                    st.session_state.processed_text = True
+def handle_qa(question: str, qa_system: Callable):
+    if not question.strip():
+        return
+        
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Add user question
+    st.session_state.chat_history.append({
+        "role": "user",
+        "content": question,
+        "timestamp": timestamp
+    })
+    
+    # Get streaming response
+    response = qa_system(question)
+    
+    # Add assistant response
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "content": response,
+        "timestamp": timestamp
+    })
 
-            # Display summary section
-            st.markdown("---")
-            st.subheader("📑 Document Summary")
-            
-            # Summary display and download section
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                if st.session_state.summaries:
-                    for i, summary in enumerate(st.session_state.summaries, 1):
-                        with st.expander(f"Section {i} Summary"):
-                            st.write(summary)
-            
-            with col2:
-                if st.session_state.summary_pdf_path:
-                    with open(st.session_state.summary_pdf_path, "rb") as file:
-                        st.download_button(
-                            label="📥 Download Full Summary PDF",
-                            data=file,
-                            file_name=st.session_state.summary_pdf_path,
-                            mime="application/pdf",
-                            help="Download a PDF containing all section summaries"
-                        )
-                    
-                    # Add a button to generate a shorter version
-                    if st.button("📄 Generate Concise Summary"):
-                        with st.spinner("Generating concise summary..."):
-                            # Create a shorter version of the summaries
-                            concise_summaries = [s[:200] + "..." for s in st.session_state.summaries]
-                            concise_pdf_path = processor.create_summary_pdf(
-                                concise_summaries,
-                                {**metadata, "Version": "Concise"}
-                            )
-                            
-                            with open(concise_pdf_path, "rb") as file:
-                                st.download_button(
-                                    label="📥 Download Concise Summary",
-                                    data=file,
-                                    file_name=f"concise_{concise_pdf_path}",
-                                    mime="application/pdf",
-                                    help="Download a shorter version of the summary"
-                                )
+def main():
+    initialize_streamlit()
+    
+    st.title("📚 PDF Processor Pro")
+    st.write("Upload your PDF for AI-powered summarization and interactive Q&A")
 
-            # Chat interface
-            st.markdown("---")
-            st.subheader("💬 Chat with your Document")
-            
-            # Display existing chat history
-            display_chat()
-            
-            # Question input with improved layout
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                question = st.text_input(
-                    "Ask a detailed question about your document:",
-                    key="question_input",
-                    placeholder="Type your question here... (e.g., 'What are the main topics discussed in this document?')"
-                )
-            with col2:
-                send_button = st.button("Send 📤", key="send_button")
-            
-            if send_button and question:
-                # Add user question to chat history
-                add_message("user", question)
+    if 'processor' not in st.session_state:
+        st.session_state.processor = PDFProcessor()
+        
+    if not st.session_state.processor.mistral_client.check_connection():
+        st.error("❌ Cannot connect to Ollama service. Please ensure it's running.")
+        return
+
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key='pdf_uploader')
+    
+    if uploaded_file:
+        if not hasattr(st.session_state, 'processed_text') or not st.session_state.processed_text:
+            with st.spinner("Processing PDF..."):
+                text = st.session_state.processor.extract_text(uploaded_file)
+                chunks = st.session_state.processor.text_splitter.split_text(text)
                 
-                # Get answer using cached qa_system
-                with st.spinner("🤔 Analyzing document and generating response..."):
-                    answer = st.session_state.qa_system(question)
-                    if answer:
-                        add_message("assistant", answer)
+                progress_bar = st.progress(0)
+                summaries = []
                 
-                # Clear the input
-                st.session_state.question_input = ""
-                st.rerun()
-            
-            # Chat management buttons
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("🗑️ Clear Chat", key="clear_chat"):
-                    if st.session_state.chat_history:
-                        st.session_state.chat_history = []
-                        st.rerun()
-            
-            # Add session information
-            with st.expander("ℹ️ Session Information"):
-                st.write(f"Documents Processed: {1 if st.session_state.processed_text else 0}")
-                st.write(f"Number of Summaries: {len(st.session_state.summaries)}")
-                st.write(f"Chat Messages: {len(st.session_state.chat_history)}")
+                # Process chunks with parallel processing
+                chunk_groups = [chunks[i:i + 4] for i in range(0, len(chunks), 4)]
+                for i, group in enumerate(chunk_groups):
+                    group_summaries = st.session_state.processor.process_chunks_parallel(group)
+                    summaries.extend(group_summaries)
+                    progress_bar.progress((i + 1) / len(chunk_groups))
                 
-        except Exception as e:
-            st.error(f"❌ An error occurred: {str(e)}")
-            logging.error(f"Application error: {str(e)}")
+                st.session_state.summaries = summaries
+                
+                # Create and save summary PDF
+                metadata = {
+                    "Original File": uploaded_file.name,
+                    "Processed Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Number of Sections": len(summaries),
+                    "Processing Engine": "Mistral"
+                }
+                
+                summary_pdf_path = st.session_state.processor.create_summary_pdf(summaries, metadata)
+                st.session_state.summary_pdf_path = summary_pdf_path
+                st.session_state.qa_system = create_qa_system(text)
+                st.session_state.processed_text = True
+                
+                st.success("✅ Processing complete!")
+
+        # Display summary section
+        st.markdown("---")
+        st.subheader("📑 Document Summary")
+        
+        # Summary display and download section
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if hasattr(st.session_state, 'summaries'):
+                for i, summary in enumerate(st.session_state.summaries, 1):
+                    with st.expander(f"Section {i} Summary"):
+                        st.write(summary)
+        
+        with col2:
+            if hasattr(st.session_state, 'summary_pdf_path'):
+                with open(st.session_state.summary_pdf_path, "rb") as file:
+                    st.download_button(
+                        label="📥 Download Full Summary PDF",
+                        data=file,
+                        file_name=st.session_state.summary_pdf_path,
+                        mime="application/pdf",
+                        help="Download a PDF containing all section summaries"
+                    )
+
+        # Q&A Section
+        st.markdown("---")
+        st.subheader("❓ Ask Questions About Your Document")
+        
+        # Chat interface
+        display_chat()
+        
+        # Create a form for the chat input
+        with st.form(key="chat_form", clear_on_submit=True):
+            question = st.text_input("Type your question:", key="question_input")
+            submit_button = st.form_submit_button("Send")
             
-            # Provide recovery options
-            if st.button("🔄 Reset Application"):
-                st.session_state.clear()
+            if submit_button and question:
+                handle_qa(question, st.session_state.qa_system)
                 st.rerun()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        st.error(f"❌ Application Error: {str(e)}")
+        logger.error(f"Application Error: {str(e)}")
+        if st.button("🔄 Restart Application"):
+            st.session_state.clear()
+            st.rerun()
