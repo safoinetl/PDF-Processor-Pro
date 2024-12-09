@@ -1,49 +1,39 @@
-# PDF Processor Pro
+# 📚 PDF Processor Pro
 
-## Overview
+PDF Processor Pro is a Streamlit-powered application that leverages AI for summarizing PDF documents and enabling interactive Q&A sessions. It uses the Mistral API for generating summaries and answering questions based on the document's content.
 
-**PDF Processor Pro** is a web-based application that allows users to upload PDF documents and interact with them through summarization and question answering (Q&A). The app extracts text from the uploaded PDF and processes it for two main features:
+---
 
-1. **Text Summarization**: The app splits the text into manageable chunks, summarizes the content, and displays it in an easily digestible format.
-2. **Question Answering**: The app allows users to ask questions about the content of the document, and it returns relevant answers based on the document's contents.
+## Features
+- **PDF Text Extraction**: Extracts text from uploaded PDF files.
+- **AI-Powered Summarization**: Summarizes large documents into concise sections.
+- **Interactive Q&A System**: Enables users to ask questions based on the document's content.
+- **Summary PDF Generation**: Saves summarized content in a PDF format.
+- **Parallel Processing**: Efficiently processes large documents using multithreading.
+- **User-Friendly Interface**: Intuitive UI with expandable summaries and a chat-like Q&A system.
 
-This app is built using **Streamlit**, **HuggingFace** models, **LangChain**, and **FAISS** for document processing, and **PyPDF2**, **pdfplumber**, and **FPDF** for handling PDF documents.
+---
 
-### Features
+## How It Works
+1. **Upload a PDF**: Upload your document via the file uploader.
+2. **Summarize**: The application splits the text into chunks, summarizes each using the Mistral API, and generates a summary PDF.
+3. **Q&A Interaction**: Users can ask questions about the document, and the application provides accurate responses based on the content.
 
-- **Upload a PDF**: Upload a PDF document to interact with its content.
-- **Summarization**: Get summaries of the content extracted from the PDF.
-- **Q&A**: Ask specific questions, and the app will search through the document to provide relevant answers.
-- **Text Processing**: The application uses advanced models to handle text processing and chunking for efficient summarization and question answering.
+---
 
-## Requirements
+## Installation
 
-### Python Version
+### Prerequisites
+- Python 3.8+
+- Pip
 
-- Python 3.7+
-
-### Dependencies
-
-The following Python libraries are required to run the application:
-
-- **streamlit**: For building the web app interface.
-- **PyPDF2**: To handle PDF parsing.
-- **fpdf**: To create PDFs, if needed.
-- **langchain**: For text chunking and question-answering functionality.
-- **langchain_community**: For utilizing HuggingFace embeddings and vector stores.
-- **pdfplumber**: For extracting text from PDF files.
-- **transformers**: For handling pre-trained models from HuggingFace.
-- **dotenv**: For loading environment variables securely.
-
-### Install Dependencies
-
-To install the necessary dependencies, create a virtual environment and run the following:
-
+### Clone the Repository
 ```bash
-# Create and activate a virtual environment (if not already done)
-python -m venv venv
-source venv/bin/activate   # On Windows use `venv\Scripts\activate`
-
-# Install dependencies
+git clone https://github.com/your-username/pdf-processor-pro.git
+cd pdf-processor-pro
 pip install -r requirements.txt
+```
+### run
+```bash
+streamlit run app.py
 ```
